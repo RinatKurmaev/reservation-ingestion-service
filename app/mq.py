@@ -162,6 +162,49 @@ class Publisher:
         )
         self._check_confirmed(result, "dlq publish")
 
+    async def purge_queues(self) -> dict[str, int]:
+        """Purge all messages from main / retry / DLQ (demo reset endpoint).
+
+        Returns the per-queue message counts as they were before the purge.
+        """
+        topology = self._ensure()
+        purged = {
+            self.settings.main_queue: (await topology.main_queue.purge()).message_count,
+            self.settings.retry_queue: (await topology.retry_queue.purge()).message_count,
+            self.settings.dlq_queue: (await topology.dlq.purge()).message_count,
+        }
+        logger.info("queues purged: %s", purged)
+        return purged
+
+    async def queue_stats(self) -> dict[str, dict[str, int]]:
+        """Live message counts for main / retry / DLQ via PASSIVE declarations.
+
+        Passive declares only assert that the queues exist (with the exact
+        arguments they already have) and return the broker's counters — they
+        never re-declare or change anything, so there is no PRECONDITION_FAILED
+        risk. No database access, which is the point: the dashboard's queue
+        panel keeps working (and proves messages are cooling down in the retry
+        queue) even while the DB is down.
+
+        Declared on the *underlay* aiormq channel on purpose: a passive
+        declare_queue() on the RobustChannel returns the CACHED queue object
+        with its stale declaration_result from connect time (all counters 0).
+        """
+        self._ensure()  # raises a clear error if the publisher is not connected
+        underlay = await self._channel.get_underlay_channel()
+        stats: dict[str, dict[str, int]] = {}
+        for name in (
+            self.settings.main_queue,
+            self.settings.retry_queue,
+            self.settings.dlq_queue,
+        ):
+            result = await underlay.queue_declare(queue=name, passive=True)
+            stats[name] = {
+                "messages": result.message_count,
+                "consumers": result.consumer_count,
+            }
+        return stats
+
     async def close(self) -> None:
         if self._connection is not None:
             await self._connection.close()

@@ -27,7 +27,16 @@ Accepts a single reservation (schema above).
 2. On validation failure → `422` with error details.
 3. On success → publish the reservation payload to the RabbitMQ queue and return
    `202 Accepted` with the generated `job_id` immediately (do not wait for storage).
-4. Optional: `GET /jobs/{job_id}` to poll job state (useful when no callback_url).
+4. **DB outage exception (queue-first admission):** if the job record cannot be
+   committed because PostgreSQL is unreachable, the API still returns
+   `202 Accepted` with `state: "queued"` and publishes the **full job spec**
+   (`job_id`, `idempotency_key`, `payload`, `callback_url`). The queue message
+   is the durable record; the worker materializes the job row on the first
+   delivery where the DB is reachable (before that, messages cool down in the
+   retry queue, §4.2). `GET /jobs/{job_id}` returns 404 until the row exists.
+   Duplicates admitted during the outage are still arbitrated by the UNIQUE
+   constraint on `reservations.idempotency_key` at insert time.
+5. Optional: `GET /jobs/{job_id}` to poll job state (useful when no callback_url).
 
 ## 2. Queue handler
 

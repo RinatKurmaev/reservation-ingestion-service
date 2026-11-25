@@ -10,7 +10,13 @@ Failure strategy:
 - unique-violation on reservations.idempotency_key -> `duplicate` (or an
   idempotent replay-completion if the same job was redelivered after a crash).
 - unparseable/unknown messages -> parked in the DLQ with error headers.
+- queue-first admissions (task.md §1: messages carrying the full job spec
+  because the API could not persist the job row during a DB outage) get their
+  job row materialized on the first delivery where the DB is reachable.
 - a reaper requeues job rows stuck in `processing` beyond the lease timeout.
+- a DB outage at BOOT does not stop consumption: the worker waits briefly for
+  the schema, then consumes anyway — messages nack into the retry queue and
+  cool down for the queue-level TTL (§4.2) until the DB returns.
 """
 
 import asyncio
@@ -50,6 +56,25 @@ def reservation_kwargs(payload: dict) -> dict:
         "num_guests": int(payload["num_guests"]),
         "guest_names": [str(name) for name in payload["guest_names"]],
     }
+
+
+def maybe_simulated_failure(payload: dict, header_retry: int) -> None:
+    """Fault injection for scenario demos (`simulate_error` in the payload).
+
+    Fires only on the first delivery attempt (`x-retry-count == 0`):
+    - "transient"  -> fails once, then succeeds on redelivery (exercises the
+      retry queue / backoff path deterministically).
+    - "permanent"  -> classified PermanentError: the job fails immediately and
+      keeps failing on every replay, because the marker travels with the payload.
+    The marker is not stored and does not affect the idempotency key.
+    """
+    marker = payload.get("simulate_error")
+    if not marker or header_retry > 0:
+        return
+    if marker == "transient":
+        raise TransientError("simulated transient failure (fault injection)")
+    if marker == "permanent":
+        raise PermanentError("simulated permanent failure (fault injection)")
 
 
 def _now() -> datetime:
@@ -133,9 +158,14 @@ class Worker:
                 await session.execute(select(Job).where(Job.id == job_id))
             ).scalar_one_or_none()
             if job is None:
-                logger.error("message references unknown job %s; dead-lettering", job_id)
-                await self._dead_letter(message, body, f"unknown job id {job_id}")
-                return
+                # No row yet: either a queue-first admission (the API could not
+                # persist the row because the DB was down — the message carries
+                # the full job spec, §1) or a genuinely unknown job.
+                job = await self._materialize_job(session, parsed, job_id)
+                if job is None:
+                    logger.error("message references unknown job %s; dead-lettering", job_id)
+                    await self._dead_letter(message, body, f"unknown job id {job_id}")
+                    return
             if job.state in TERMINAL_STATES:
                 logger.info(
                     "job %s already in terminal state %s; acking redundant delivery",
@@ -166,6 +196,7 @@ class Worker:
                 return
 
             try:
+                maybe_simulated_failure(payload, header_retry)
                 # Insert + state transition in ONE transaction; the UNIQUE
                 # constraint on idempotency_key is the dedupe guarantee.
                 reservation = Reservation(
@@ -190,6 +221,44 @@ class Worker:
             logger.info("job %s completed (reservation %s)", job.id, job.reservation_id)
             self.fire_webhook(job)
             await message.ack()
+
+    async def _materialize_job(
+        self, session: AsyncSession, parsed: dict, job_id: UUID
+    ) -> Job | None:
+        """Create the job row for a queue-first admission message (task.md §1).
+
+        While the DB was down, the API could not persist the job row before
+        publishing, so the message carries the full job spec
+        (job_id, idempotency_key, payload, callback_url). The row is born here,
+        on the first delivery where the DB is reachable; until then creation
+        fails and the message cools down in the retry queue. Returns None for
+        messages that are not queue-first admissions (no idempotency_key).
+        """
+        idem_key = parsed.get("idempotency_key")
+        if not idem_key:
+            return None
+        payload = dict(parsed["payload"])
+        # The demo fault-injection marker is not stored (same rule as the API).
+        payload.pop("simulate_error", None)
+        job = Job(
+            id=job_id,
+            idempotency_key=str(idem_key),
+            payload=payload,
+            state=JobState.pending,
+            callback_url=parsed.get("callback_url") or None,
+            created_at=_now(),
+            updated_at=_now(),
+        )
+        session.add(job)
+        try:
+            await session.commit()
+            logger.info("materialized job %s from a queue-first admission message", job_id)
+        except IntegrityError:
+            # The row appeared concurrently (redelivery racing another
+            # consumer): reload it and continue with the normal flow.
+            await session.rollback()
+            job = await reload_job(session, job_id)
+        return job
 
     async def _on_integrity_error(
         self, session: AsyncSession, job_id: UUID, message, exc: IntegrityError
@@ -302,6 +371,24 @@ class Worker:
         await message.ack()
 
 
+async def init_db_forever() -> None:
+    """Keep retrying schema creation in the background, forever if needed.
+
+    The consumer must not gate consumption on a reachable DB (see main): during
+    a full outage messages have to nack into the retry queue instead of the
+    worker sitting in a boot-time crash/restart loop.
+    """
+    while True:
+        try:
+            await init_db(retries=15, delay=2.0)
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("database schema still unreachable (%s); retrying in 30s", exc)
+            await asyncio.sleep(30)
+
+
 async def reaper_loop(worker: Worker) -> None:
     """Requeue job rows stuck in `processing` beyond the lease timeout
     (their messages were lost with the consumer that died mid-processing)."""
@@ -339,8 +426,21 @@ async def main() -> None:
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
-    await init_db()
     worker = Worker()
+    init_task = asyncio.create_task(init_db_forever(), name="init-db")
+    try:
+        # Short grace period for the schema at boot (a fresh stack creates
+        # tables in milliseconds). Never block longer than this: a full DB
+        # outage must not stall consumption — the worker starts consuming and
+        # every message nacks into the retry queue (SCENARIOS.md §4.2) until
+        # the DB is back, which is the promised cool-down behavior.
+        await asyncio.wait_for(asyncio.shield(init_task), timeout=15)
+        logger.info("database schema ready")
+    except Exception as exc:
+        logger.warning(
+            "starting consumption without a ready DB (%s) — messages nack into "
+            "the retry queue until it recovers (SCENARIOS.md §4.2)", exc,
+        )
     await worker.start()
 
     stop = asyncio.Event()
@@ -351,6 +451,7 @@ async def main() -> None:
     try:
         await stop.wait()
     finally:
+        init_task.cancel()
         await worker.stop()
 
 

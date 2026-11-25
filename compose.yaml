@@ -19,6 +19,12 @@ services:
 
   rabbitmq:
     image: docker.io/library/rabbitmq:3.13-management-alpine
+    # FIXED hostname: RabbitMQ's node name is rabbit@<hostname> and its data
+    # lives in mnesia/rabbit@<hostname> inside the volume. Without this,
+    # podman-compose container recreations change the hash hostname -> the node
+    # boots with an EMPTY store ("Recovering 0 queues") and silently loses all
+    # durable queue definitions AND messages despite the volume.
+    hostname: rabbitmq
     ports:
       - "5672:5672"
       - "15672:15672"
@@ -51,10 +57,29 @@ services:
     command: ["python", "-m", "app.consumer"]
     environment: *app_env
     depends_on:
-      db:
-        condition: service_healthy
       rabbitmq:
         condition: service_healthy
+    restart: unless-stopped
+    # NOTE: deliberately NO depends_on on db. podman-compose turns depends_on
+    # into podman-level container dependencies (--requires), and then ANY
+    # `podman start worker` silently starts the db too — which would make the
+    # full-DB-outage demo impossible (the worker must be started while the DB
+    # is down). The worker tolerates a missing DB at boot: init_db retries for
+    # ~30s and messages nack into the retry queue (SCENARIOS.md §4.2).
+
+  # Scenario dashboard: static demo UI in its own container, decoupled from the
+  # API process. nginx serves the page and proxies /api/ -> api:8000, so the
+  # browser stays same-origin (no CORS) and the page still loads when the API
+  # (or the whole system) is down — it then just shows everything unreachable.
+  dashboard:
+    image: docker.io/library/nginx:alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./dashboard/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./dashboard/index.html:/usr/share/nginx/html/index.html:ro
+    depends_on:
+      - api
     restart: unless-stopped
 
 volumes:
